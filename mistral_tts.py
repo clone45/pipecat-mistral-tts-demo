@@ -1,41 +1,82 @@
 """Mistral Voxtral TTS service for Pipecat.
 
-Streams audio from Mistral's Voxtral TTS API via SSE, converting float32 PCM
-to int16 PCM for Pipecat's audio pipeline.
+Streams audio from Mistral's Voxtral TTS API via SSE using raw aiohttp
+HTTP streaming. This bypasses the Mistral SDK's event parser, which batches
+audio into large chunks that cause choppy playback through WebRTC transports.
 
-KNOWN ISSUE: Audio is choppy when played through Daily WebRTC transport.
-Pre-buffered audio through the same transport sounds perfect.
-See README.md for full investigation details.
+Reading directly from the HTTP response with iter_any() lets the network I/O
+naturally pace the event loop, matching the pattern used by Pipecat's built-in
+NeuphonicHttpTTSService.
+
+Requires:
+    pip install pipecat-ai[daily] aiohttp numpy
+
+Example:
+    tts = MistralTTSService(
+        api_key="your-api-key",
+        voice_id="gb_jane_neutral",
+    )
 """
 
+import aiohttp
 import asyncio
 import base64
+import json
 import time
 from typing import AsyncGenerator, Optional
 
 import numpy as np
 from loguru import logger
-from mistralai.client.sdk import Mistral
-from mistralai.client.models.speechstreamaudiodelta import SpeechStreamAudioDelta
 
 from pipecat.frames.frames import ErrorFrame, Frame, TTSAudioRawFrame
 from pipecat.services.settings import TTSSettings
 from pipecat.services.tts_service import TTSService
 
+# Voxtral always outputs 24kHz audio
 VOXTRAL_SAMPLE_RATE = 24000
-YIELD_CHUNK_BYTES = 4800     # 100ms of int16 mono at 24kHz
-JITTER_BUFFER_BYTES = 28800  # 600ms jitter buffer
+
+
+def _float32le_to_int16(data: bytes) -> bytes:
+    """Convert raw float32 little-endian PCM to int16 PCM.
+
+    Voxtral's PCM streaming format outputs float32 LE samples in [-1.0, 1.0].
+    Pipecat's audio pipeline expects int16 PCM (2 bytes per sample).
+    """
+    samples = np.frombuffer(data, dtype=np.float32)
+    clipped = np.clip(samples, -1.0, 1.0)
+    return (clipped * 32767).astype(np.int16).tobytes()
 
 
 class MistralTTSService(TTSService):
-    """Mistral Voxtral TTS service — choppy audio under investigation."""
+    """Mistral Voxtral TTS service using raw HTTP streaming.
+
+    Streams audio via SSE from Mistral's /v1/audio/speech endpoint using
+    aiohttp's raw byte reader. Voxtral outputs float32 LE PCM at 24kHz;
+    this service converts to int16 PCM for Pipecat's audio pipeline.
+
+    Important: The transport's audio_out_sample_rate should be set to 48000
+    (not 24000). Pipecat's SOXR resampler handles the 24kHz -> 48kHz
+    conversion automatically. Running the transport at 24kHz causes choppy
+    playback due to Daily's WebRTC audio engine expecting 48kHz.
+
+    Voice IDs can be preset slugs (e.g. "gb_jane_neutral", "en_paul_cheerful")
+    or custom voice UUIDs created via the Mistral Voices API.
+
+    Args:
+        api_key: Mistral API key.
+        voice_id: Preset slug or custom voice UUID. Defaults to "gb_jane_neutral".
+        model: Voxtral model ID. Defaults to "voxtral-mini-tts-2603".
+        aiohttp_session: Optional shared aiohttp session. If not provided,
+            a new session is created per request.
+    """
 
     def __init__(
         self,
         *,
-        api_key: Optional[str] = None,
+        api_key: str,
         voice_id: str = "gb_jane_neutral",
         model: str = "voxtral-mini-tts-2603",
+        aiohttp_session: Optional[aiohttp.ClientSession] = None,
         **kwargs,
     ):
         default_settings = TTSSettings(model=model, voice=voice_id, language=None)
@@ -46,9 +87,10 @@ class MistralTTSService(TTSService):
             settings=default_settings,
             **kwargs,
         )
-        self._client = Mistral(api_key=api_key)
+        self._api_key = api_key
         self._voice_id = voice_id
         self._model = model
+        self._session = aiohttp_session
 
     def can_generate_metrics(self) -> bool:
         return True
@@ -57,101 +99,114 @@ class MistralTTSService(TTSService):
         logger.debug(f"{self}: Generating TTS [{text}]")
 
         t0 = time.monotonic()
-        audio_queue: asyncio.Queue = asyncio.Queue()
 
-        async def fetch_sse():
-            try:
-                stream = await self._client.audio.speech.complete_async(
-                    input=text,
-                    model=self._model,
-                    voice_id=self._voice_id,
-                    response_format="pcm",
-                    stream=True,
-                )
-                chunk_num = 0
-                async with stream:
-                    async for event in stream:
-                        data = event.data if hasattr(event, "data") else event
-                        if isinstance(data, SpeechStreamAudioDelta):
-                            raw_bytes = base64.b64decode(data.audio_data)
-                            pcm_int16 = _float32le_to_int16(raw_bytes)
-                            if len(pcm_int16) > 0:
-                                chunk_num += 1
-                                await audio_queue.put(pcm_int16)
-                await audio_queue.put(None)
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                logger.error(f"[fetch_sse] Error: {e}")
-                await audio_queue.put(e)
+        url = "https://api.mistral.ai/v1/audio/speech"
+        headers = {
+            "Authorization": f"Bearer {self._api_key}",
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+        }
+        payload = {
+            "model": self._model,
+            "input": text,
+            "voice_id": self._voice_id,
+            "response_format": "pcm",
+            "stream": True,
+        }
 
-        fetch_task = asyncio.create_task(fetch_sse())
+        session = self._session
+        should_close = False
+        if session is None:
+            session = aiohttp.ClientSession()
+            should_close = True
 
-        try:
-            await self.start_tts_usage_metrics(text)
-        except Exception:
-            pass
-
-        buffer = bytearray()
         chunk_count = 0
         total_audio_bytes = 0
         ttfb = None
-        started_yielding = False
 
         try:
-            while True:
-                if not started_yielding and len(buffer) < JITTER_BUFFER_BYTES:
-                    item = await audio_queue.get()
-                    if item is None:
-                        started_yielding = True
-                    elif isinstance(item, Exception):
-                        yield ErrorFrame(error=f"Mistral TTS error: {item}")
-                        break
-                    else:
-                        buffer.extend(item)
-                        if ttfb is None:
-                            ttfb = time.monotonic() - t0
-                            try:
-                                await self.stop_ttfb_metrics()
-                            except Exception:
-                                pass
-                        continue
+            async with session.post(url, json=payload, headers=headers) as response:
+                if response.status != 200:
+                    error_text = await response.text()
+                    logger.error(f"{self}: Mistral API error: {response.status} - {error_text}")
+                    yield ErrorFrame(error=f"Mistral API error: {response.status}")
+                    return
 
-                started_yielding = True
+                try:
+                    await self.start_tts_usage_metrics(text)
+                except Exception:
+                    pass
 
-                if len(buffer) < YIELD_CHUNK_BYTES:
-                    item = await audio_queue.get()
-                    if item is None:
-                        break
-                    if isinstance(item, Exception):
-                        yield ErrorFrame(error=f"Mistral TTS error: {item}")
-                        break
-                    buffer.extend(item)
+                # Read the SSE stream using iter_any() which yields bytes as
+                # they arrive from the network, then reassemble into lines.
+                #
+                # Why not use the Mistral SDK or response.content's line iterator?
+                # - The Mistral SDK's SSE parser batches audio into large chunks
+                #   (up to 96KB), which blocks the event loop and starves the
+                #   Daily WebRTC transport's audio write thread.
+                # - aiohttp's line iterator has a high_water limit (~64KB) that
+                #   Mistral's base64 audio lines exceed, causing "Chunk too big".
+                #
+                # iter_any() reads raw TCP chunks and naturally yields control
+                # to the event loop between reads, letting the transport process
+                # audio smoothly. This matches Pipecat's NeuphonicHttpTTSService.
+                pending = b""
+                async for raw_chunk in response.content.iter_any():
+                    pending += raw_chunk
+                    while b"\n" in pending:
+                        line_bytes, pending = pending.split(b"\n", 1)
+                        message = line_bytes.decode("utf-8", errors="ignore").strip()
 
-                while len(buffer) >= YIELD_CHUNK_BYTES:
-                    chunk = bytes(buffer[:YIELD_CHUNK_BYTES])
-                    del buffer[:YIELD_CHUNK_BYTES]
-                    chunk_count += 1
-                    total_audio_bytes += len(chunk)
-                    yield TTSAudioRawFrame(
-                        chunk, self.sample_rate, 1, context_id=context_id,
-                    )
-                    await asyncio.sleep(0.01)
+                        if not message or not message.startswith("data:"):
+                            continue
 
-            if len(buffer) > 0:
-                aligned_len = len(buffer) & ~1
-                if aligned_len > 0:
-                    chunk_count += 1
-                    total_audio_bytes += aligned_len
-                    yield TTSAudioRawFrame(
-                        bytes(buffer[:aligned_len]),
-                        self.sample_rate, 1, context_id=context_id,
-                    )
+                        data_content = message[len("data:"):].strip()
+                        if data_content == "[DONE]":
+                            break
+
+                        try:
+                            parsed = json.loads(data_content)
+                            audio_b64 = parsed.get("audio_data")
+
+                            if audio_b64:
+                                raw_bytes = base64.b64decode(audio_b64)
+                                pcm_int16 = _float32le_to_int16(raw_bytes)
+
+                                if len(pcm_int16) > 0:
+                                    if ttfb is None:
+                                        ttfb = time.monotonic() - t0
+                                    try:
+                                        await self.stop_ttfb_metrics()
+                                    except Exception:
+                                        pass
+
+                                    chunk_count += 1
+                                    total_audio_bytes += len(pcm_int16)
+
+                                    yield TTSAudioRawFrame(
+                                        audio=pcm_int16,
+                                        sample_rate=self.sample_rate,
+                                        num_channels=1,
+                                        context_id=context_id,
+                                    )
+
+                        except json.JSONDecodeError:
+                            logger.warning(f"{self}: Failed to parse SSE JSON: {data_content[:100]}")
+                        except Exception as e:
+                            logger.error(f"{self}: Error processing audio chunk: {e}")
+
+        except asyncio.CancelledError:
+            logger.debug(f"{self}: TTS generation cancelled")
+            raise
+        except Exception as e:
+            logger.error(f"{self}: Mistral TTS error: {e}")
+            yield ErrorFrame(error=f"Mistral TTS error: {e}")
         finally:
-            fetch_task.cancel()
+            if should_close:
+                await session.close()
             try:
-                await fetch_task
-            except asyncio.CancelledError:
+                await self.stop_ttfb_metrics()
+            except Exception:
                 pass
 
         elapsed = time.monotonic() - t0
@@ -162,9 +217,3 @@ class MistralTTSService(TTSService):
             f"ttfb={ttfb_ms:.0f}ms total={elapsed * 1000:.0f}ms "
             f"chunks={chunk_count} audio={audio_duration:.1f}s"
         )
-
-
-def _float32le_to_int16(data: bytes) -> bytes:
-    samples = np.frombuffer(data, dtype=np.float32)
-    clipped = np.clip(samples, -1.0, 1.0)
-    return (clipped * 32767).astype(np.int16).tobytes()

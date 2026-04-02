@@ -1,14 +1,12 @@
 [project]
-name = "pipecat-mistral-tts-demo"
+name = "pipecat-mistral-tts"
 version = "0.1.0"
-description = "Demo reproducing choppy audio when streaming Mistral Voxtral TTS through Pipecat + Daily WebRTC"
+description = "Pipecat TTS adapter for Mistral's Voxtral text-to-speech API"
 requires-python = ">=3.11"
 dependencies = [
     "pipecat-ai[daily,silero]==0.0.108",
-    "mistralai>=2.2.0",
-    "numpy",
     "aiohttp",
+    "numpy",
     "python-dotenv",
     "loguru",
-    "matplotlib",
 ]
